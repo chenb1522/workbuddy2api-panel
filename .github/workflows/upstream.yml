@@ -1,0 +1,121 @@
+name: sync-upstream
+
+# 把 chenb1522/workbuddy2api-panel 自动对齐到上游 misakano7545/workbuddy2api-panel
+#
+# 默认策略 rebase：把 fork 里自己的提交（例如本文件）搬到上游最新提交之上，
+# 上游没有的文件绝不会被动到；有冲突则 abort 并报错，不留半截状态。
+# 手动 Run workflow 可选 ff / merge / mirror。
+# mirror 会丢弃 fork 自有提交、强制对齐上游 —— 会连本文件一起删掉，只在确认纯镜像时用。
+
+on:
+  schedule:
+    - cron: "17 */2 * * *" # 每 2 小时 17 分（UTC），错开整点高峰
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: "同步策略：rebase=搬运自有提交(默认) / merge=合并 / ff=仅快进 / mirror=强制对齐上游"
+        type: choice
+        options: [rebase, merge, ff, mirror]
+        default: rebase
+
+permissions:
+  contents: write
+
+# 同一时间只跑一个，避免两次同步互相推
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: misakano7545/workbuddy2api-panel
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # 用默认 GITHUB_TOKEN：推送不会触发其它 workflow（GitHub 防递归）。
+          # 想让同步后的提交去跑 binaries.yml / docker-ghcr.yml，
+          # 把下面换成 secrets.AUTOBOT_TOKEN（仓库里已有这个 PAT）。
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync from upstream
+        id: sync
+        env:
+          STRATEGY: ${{ inputs.strategy || 'rebase' }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${TARGET_BRANCH}"
+          UP="upstream/${TARGET_BRANCH}"
+
+          BEHIND=$(git rev-list --count "HEAD..${UP}")
+          AHEAD=$(git rev-list --count "${UP}..HEAD")
+
+          {
+            echo "### 上游同步"
+            echo ""
+            echo "- 上游 HEAD：\`$(git rev-parse --short "${UP}")\` $(git log -1 --format='%s' "${UP}")"
+            echo "- 落后 / 领先：${BEHIND} / ${AHEAD}"
+            echo "- 策略：${STRATEGY}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${BEHIND}" -eq 0 ]; then
+            echo "已是最新，无需同步"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "${STRATEGY}" in
+            rebase)
+              # 自有提交（本文件等）被逐个搬到上游最新提交之上，线性历史，不会产生 merge commit
+              if ! git rebase "${UP}"; then
+                git rebase --abort || true
+                echo "::error::rebase 冲突，已回滚到同步前状态。请本地 rebase 解决后再推"
+                exit 1
+              fi
+              git push --force-with-lease origin "HEAD:${TARGET_BRANCH}"
+              ;;
+            merge)
+              if ! git merge --no-edit -m "chore: merge upstream ${UPSTREAM_REPO}@${TARGET_BRANCH}" "${UP}"; then
+                git merge --abort || true
+                echo "::error::合并冲突，已 abort。请本地解决冲突后推送，本次不同步"
+                exit 1
+              fi
+              git push origin "HEAD:${TARGET_BRANCH}"
+              ;;
+            ff)
+              # 注意：fork 一旦有上游没有的提交（例如本文件），ff 必然失败，
+              # 因为快进要求 HEAD 是上游的祖先。日常请用 rebase。
+              if ! git merge-base --is-ancestor HEAD "${UP}"; then
+                echo "::error::fork 有 ${AHEAD} 个上游没有的提交，无法快进；改用 rebase 或 merge"
+                exit 1
+              fi
+              git merge --ff-only "${UP}"
+              git push origin "HEAD:${TARGET_BRANCH}"
+              ;;
+            mirror)
+              echo "::warning::mirror 模式：丢弃 fork 自有提交（含本 workflow 文件），强制对齐上游"
+              git reset --hard "${UP}"
+              git push --force-with-lease origin "HEAD:${TARGET_BRANCH}"
+              echo "- 结果：已强制对齐到 \`$(git rev-parse --short HEAD)\`，fork 自有提交连同本文件已移除" >> "$GITHUB_STEP_SUMMARY"
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "::error::未知策略 ${STRATEGY}"
+              exit 1
+              ;;
+          esac
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "- 结果：已同步到 \`$(git rev-parse --short HEAD)\`" >> "$GITHUB_STEP_SUMMARY"
